@@ -1,0 +1,566 @@
+/*
+ * ***** BEGIN LICENSE BLOCK *****
+ * Zimbra Collaboration Suite Zimlets
+ * Copyright (C) 2009, 2010 Zimbra, Inc.
+ *
+ * The contents of this file are subject to the Zimbra Public License
+ * Version 1.3 ("License"); you may not use this file except in
+ * compliance with the License.  You may obtain a copy of the License at
+ * http://www.zimbra.com/license.
+ *
+ * Software distributed under the License is distributed on an "AS IS"
+ * basis, WITHOUT WARRANTY OF ANY KIND, either express or implied.
+ * ***** END LICENSE BLOCK *****
+ */
+
+//////////////////////////////////////////////////////////////////////////////
+// Add Stickynotes to *individual* emails. Also automatically attaches a tag "Emails with StickyNotes" so user
+// can search for such mails.
+// @author Zimlet author: Raja Rao DV(rrao@zimbra.com)
+//////////////////////////////////////////////////////////////////////////////
+
+function com_zimbra_stickyNotes_HandlerObject() {
+}
+
+com_zimbra_stickyNotes_HandlerObject.prototype = new ZmZimletBase();
+com_zimbra_stickyNotes_HandlerObject.prototype.constructor = com_zimbra_stickyNotes_HandlerObject;
+
+
+/**
+ * Simplify handler object
+ *
+ */
+var StickyNotesZimlet = com_zimbra_stickyNotes_HandlerObject;
+
+
+StickyNotesZimlet.stickyNotes = "STICKYNOTES";
+
+/**
+ * Called by Zimbra upon login
+ */
+StickyNotesZimlet.prototype.init =
+function() {
+	this._tagName = this.getMessage("sn_EmailsWithStickyNotes");
+	this._createTagAndStoreId();
+	this._migrateOldData();
+};
+
+StickyNotesZimlet.prototype.onShowView =
+function(viewId, isNewView) {
+   if(viewId == "CNS" || viewId == "CAL" || viewId == "CNS-main") {
+		var controller = appCtxt.getCurrentController();
+		try{
+			if(viewId == "CAL") {//in calendar, there are multiple views and viewId doesnt match internal views
+				for(var vid in controller._listView) {
+					controller._listView[vid].addSelectionListener(new AjxListener(this, this._onContactOrApptView, [controller]));
+				}
+			} else {
+				controller._listView[viewId].addSelectionListener(new AjxListener(this, this._onContactOrApptView, [controller]));
+			}
+		} catch(e) {
+		}
+	}
+};
+
+/**
+ * Creates Tags and stores its id
+ */
+StickyNotesZimlet.prototype._createTagAndStoreId =
+function() {
+	var tagObj = appCtxt.getActiveAccount().trees.TAG.getByName(this._tagName);
+	if (!tagObj) {
+		this._createTag({name:this._tagName, color:ZmOrganizer.C_YELLOW, callback: new AjxCallback(this, this._handleTagCreation)});
+	} else {
+		this._tagId = tagObj.nId;
+	}
+};
+/**
+ * Creates tags
+ * @param {Object} params Object that defines a tag like: name, color etc
+ */
+StickyNotesZimlet.prototype._createTag =
+function(params) {
+	var soapDoc = AjxSoapDoc.create("CreateTagRequest", "urn:zimbraMail");
+	var tagNode = soapDoc.set("tag");
+	tagNode.setAttribute("name", params.name);
+	var color = ZmOrganizer.checkColor(params.color);
+	if (color && (color != ZmOrganizer.DEFAULT_COLOR[ZmOrganizer.TAG])) {
+		tagNode.setAttribute("color", color);
+	}
+	appCtxt.getAppController().sendRequest({soapDoc:soapDoc, asyncMode:true, callback:params.callback});
+};
+
+/**
+ * Stores 'StickyNotes' Tag id
+ * @param {Object} response  Create Tag response
+ */
+StickyNotesZimlet.prototype._handleTagCreation =
+function(response) {
+	try {
+		this._tagId = response.getResponse().CreateTagResponse.tag[0].id;
+	} catch(e) {
+	}
+};
+/**
+ * Displays stickynotes widget
+ * @param {Boolean} createNew if true, creates a new StickyNotes
+ * @param String content StickyNotes content to be set
+ */
+StickyNotesZimlet.prototype._showStickyNotes =
+function(createNew, content) {
+	if (!content || !content.notes) {
+		content = "";
+	} else {
+		content = content.notes;
+	}
+	if (content == "" && !createNew) {
+		return;
+	}
+	this._createNewStickyNotes = createNew;
+	this._stickyNotesView(content);
+};
+
+/**
+ * Saves StickyNotes content
+ */
+StickyNotesZimlet.prototype._saveAndHideStickyNotes =
+function() {
+	if (!this._mainContainer) {
+		return;
+	}
+	var content = this._getStickyContent();
+	if (!this._createNewStickyNotes || (this._createNewStickyNotes && content != "")) {
+		this._saveStickyNotesDataToServer(this._itemId, content);
+	}
+	if (this._createNewStickyNotes && content != "") {
+		this._tagAction(true);
+	}
+	this._hideStickyNotes();
+};
+
+/**
+ * Gets StickyNotes Zimlet metadata
+ *
+ * @param {string} msgId Mail Id
+ * @param {AjxCallback} postCallback  A callback
+ */
+StickyNotesZimlet.prototype._getStickyNotesMetaData =
+function(msgId, postCallback) {
+	this._currentMetaData = new ZmMetaData(appCtxt.getActiveAccount(), msgId);
+	this._currentMetaData.get("stikyNotesZimletMetaData", null, new AjxCallback(this, this._handleGetStickyNotesMetaData, postCallback));
+};
+
+/**
+ * Handles Get StickyNotesMetadata response & calls back another function
+ *
+ * @param {AjxCallback} postCallback A callback
+ * @param {object} result Custom metadata response
+ */
+StickyNotesZimlet.prototype._handleGetStickyNotesMetaData =
+function(postCallback, result) {
+	this._stikyNotesMetaData = "";//nullify old data
+	try {
+		var response = result.getResponse().BatchResponse.GetCustomMetadataResponse[0];
+		if (response.meta && response.meta[0]) {
+			this._stikyNotesMetaData = response.meta[0]._attrs;
+		}
+		if (postCallback) {
+			postCallback.run(this._stikyNotesMetaData);
+		} else {
+			return this._stikyNotesMetaData;
+		}
+	} catch(ex) {
+		console.log('StickyNotesZimlet.prototype._handleGetStickyNotesMetaData'+ex);
+		return;
+	}
+};
+
+/**
+ * Saves StickyNotes meta data to server
+ * @param {string} msgId Appointment id
+ * @param {string} stickyNotesData data
+ */
+StickyNotesZimlet.prototype._saveStickyNotesDataToServer =
+function(msgId, stickyNotesData) {
+	this._currentMetaData = new ZmMetaData(appCtxt.getActiveAccount(), msgId);
+	var keyValArry = [];
+	keyValArry["notes"] = stickyNotesData;
+	this._currentMetaData.set("stikyNotesZimletMetaData", keyValArry, null, null);
+};
+
+/**
+ * Displays 'Notes saved' message
+ */
+StickyNotesZimlet.prototype._saveContentCallback =
+function () {
+	var transitions = [ ZmToast.FADE_IN, ZmToast.PAUSE, ZmToast.PAUSE,  ZmToast.FADE_OUT ];
+	appCtxt.getAppController().setStatusMsg(this.getMessage("sn_notesSaved"), ZmStatusView.LEVEL_INFO, null, transitions);
+};
+
+/**
+ * Tags or untags the email
+ * @param Boolean trueOrFalse If <code>true</code>, tags an email
+ */
+StickyNotesZimlet.prototype._tagAction =
+function (trueOrFalse) {
+
+	if (!appCtxt.getAccountTagList().getByName(this._tagName))
+		return;
+
+    this.srcMsgObj.list.tagItems({
+        items: this.srcMsgObj,
+        tagName: this._tagName,
+        doTag: trueOrFalse
+    });
+
+};
+
+/**
+ * Deletes StickyNotes content
+ */
+StickyNotesZimlet.prototype._deleteSaveAndHideStickyNotes =
+function() {   
+   this._deleteConfirmationDialog = new ZmDialog({
+      title: ZmMsg.confirmDeleteApptTitle,
+      parent: this.getShell(),
+      standardButtons: [DwtDialog.OK_BUTTON, DwtDialog.CANCEL_BUTTON],
+      disposeOnPopDown: true
+   });
+   var html = ZmMsg.confirmDeleteItemList;
+
+   this._deleteConfirmationDialog.setContent(html);
+   this._deleteConfirmationDialog.setButtonListener(DwtDialog.OK_BUTTON, new AjxListener(this, this._deleteSaveAndHideStickyNotesOKBtn));
+   this._deleteConfirmationDialog.setButtonListener(DwtDialog.CANCEL_BUTTON, new AjxListener(this, this._deleteSaveAndHideStickyNotesCancelBtn));
+   this._deleteConfirmationDialog._tabGroup.addMember(document.getElementById(this._deleteConfirmationDialog._button[1].__internalId));
+   this._deleteConfirmationDialog._tabGroup.addMember(document.getElementById(this._deleteConfirmationDialog._button[2].__internalId));
+   this._deleteConfirmationDialog._baseTabGroupSize = 2;        
+   this._deleteConfirmationDialog.popup();
+   if(this._getStickyContent() == ""){
+      //it's empty, delete w/o confirmation
+      this._deleteSaveAndHideStickyNotesOKBtn();
+   }
+};
+
+StickyNotesZimlet.prototype._deleteSaveAndHideStickyNotesOKBtn = 
+function () {
+	if (!this._mainContainer)
+   {
+		this._deleteConfirmationDialog.popdown();
+      return;      
+   }   
+
+	this._saveStickyNotesDataToServer(this._itemId, "");
+
+	this._hideStickyNotes();
+	if (this.srcMsgObj.hasTag(this._tagName))
+   {
+		this._tagAction(false);
+   }
+   this._deleteConfirmationDialog.popdown();      
+};
+
+StickyNotesZimlet.prototype._deleteSaveAndHideStickyNotesCancelBtn = 
+function () {
+   this._hideStickyNotes();
+   this._deleteConfirmationDialog.popdown();
+};
+
+/**
+ * Hides stickyNotes
+ */
+StickyNotesZimlet.prototype._hideStickyNotes =
+function() {
+	this._mainContainer.style.display = "none";
+	this.stickyNotesDisplayed = false;
+};
+
+/**
+ * Creates StickyNotes view
+ * @param String content StickyNotes content
+ */
+StickyNotesZimlet.prototype._stickyNotesView =
+function(content) {
+	if (this._mainContainer) {
+		this._mainContainer.style.display = "block";
+		this._setStickyContent(content);
+		if (content == "") {//focus only when its empty
+			this._focusStickyNotes();
+		}
+		this.stickyNotesDisplayed = true;
+		return;
+	}
+	this._mainContainer = document.getElementById("z_shell").appendChild(document.createElement('div'));
+	this._mainContainer.setAttribute("id","stickyn_mainID");
+
+	var html = new Array();
+	var i = 0;
+	html.push("<DIV id ='stickyn_mainIDheader' class='stickyn_axnClass'>",
+	"<DIV class='mac_button mac_white' id='btn_mac_white'></DIV>",
+	"<DIV class='mac_button mac_dark' id='btn_mac_dark'></DIV>",
+	"<DIV class='mac_button mac_base' id='btn_mac_base'></DIV>",
+	"<img  style='cursor:pointer;' src=\"", this.getResource("trash.png"), "\" id='stickyn_deleteBtn' />&nbsp;",
+	"<img  style='cursor:pointer;' src=\"", this.getResource("save.png"), "\" id='stickyn_closeBtn'/></DIV>",
+	"<TEXTAREA  id ='stickyn_textAreaID'class='stickyn_textAreaClass'>",
+	"</TEXTAREA>");
+
+	this._mainContainer.innerHTML = html.join("");
+	this._addListeners();
+	if (content) {
+		this._setStickyContent(content);
+	}
+	this.stickyNotesDisplayed = true;
+
+	// DRAGGABLE
+	this._dragElement(document.getElementById("stickyn_mainID"));
+};
+
+/**
+ * Sets sticky notes content
+ * @param String content StickyNotes content
+ */
+StickyNotesZimlet.prototype._setStickyContent =
+function(content) {
+	document.getElementById("stickyn_textAreaID").value = content;
+};
+
+/**
+ * Sets cursor focus to StickyNotes widget
+ */
+StickyNotesZimlet.prototype._focusStickyNotes =
+function() {
+	document.getElementById("stickyn_textAreaID").focus();
+};
+
+/**
+ * Gets StickyNotes Content
+ */
+StickyNotesZimlet.prototype._getStickyContent =
+function() {
+	return document.getElementById("stickyn_textAreaID").value;
+};
+
+/**
+ * Adds listeners to save & delete buttons
+ */
+StickyNotesZimlet.prototype._addListeners =
+function() {
+	document.getElementById("stickyn_closeBtn").onclick = AjxCallback.simpleClosure(this._saveAndHideStickyNotes, this);
+	document.getElementById("stickyn_deleteBtn").onclick = AjxCallback.simpleClosure(this._deleteSaveAndHideStickyNotes, this);
+	btn_mac_white.onclick = function() { 
+		stickyn_textAreaID.style.color = "#545454"
+		stickyn_textAreaID.style.background = "rgb(221, 247, 241,0.95)"
+	}
+	btn_mac_dark.onclick = function() { 
+		stickyn_textAreaID.style.color = "#fafbfd"
+		stickyn_textAreaID.style.background = "rgb(20, 18, 97,0.95)" 
+	}
+	btn_mac_base.onclick = function() {
+		stickyn_textAreaID.style.color = "#545454"
+		stickyn_textAreaID.style.background = "rgb(255, 255, 204,0.95)" 
+	}
+};
+
+/**
+ * Adds toolbar
+ *@see ZmZimletBase
+ */
+StickyNotesZimlet.prototype.initializeToolbar =
+function(app, toolbar, controller, view) {
+    view = appCtxt.getViewTypeFromId(view);
+	if (view == ZmId.VIEW_CONVLIST || view == ZmId.VIEW_CONV || view == ZmId.VIEW_TRAD || view == "CNS" || view == "CLD") {
+		ZmMsg.stickyNotesLabel = this.getMessage("sn_label");
+		ZmMsg.stickyNotesTip = this.getMessage("sn_tooltip");
+		var buttonArgs = {
+			text	: ZmMsg.stickyNotesLabel,
+			tooltip: ZmMsg.stickyNotesTip,
+			image: "stickynotes-panelIcon",
+         showImageInToolbar: true,
+         showTextInToolbar: false,
+         enabled: false
+		};
+		if(!toolbar.getOp(StickyNotesZimlet.stickyNotes)) {
+			var button = toolbar.createZimletOp(StickyNotesZimlet.stickyNotes, buttonArgs);
+			button.addSelectionListener(new AjxListener(this, this._stickyTBListener, [controller]));
+		}
+	}
+};
+
+/**
+ * Adds StickyNotes toolbar button listener
+ * @param ZmComposeController controller Compose controller
+ */
+StickyNotesZimlet.prototype._stickyTBListener =
+function(controller) {
+   try 
+   {
+	   var selectedItms = controller.getCurrentView().getSelection();
+   } catch (err) 
+   {
+      try 
+      {
+         var selectedItms = controller.getCurrentView().getListView().getSelection();
+      } catch (err)
+      {
+         //seems we cannot get the selection
+      }
+         
+   }
+
+	if (selectedItms.length > 0) {
+      if(selectedItms[0].isDL !== true) //do not support notes on DL's
+      {
+         this.srcMsgObj = selectedItms[0];
+         if (this.srcMsgObj.type == "CONV") {
+            this.srcMsgObj = this.srcMsgObj.getFirstHotMsg();
+         }
+         this._createStickyNotes(this.srcMsgObj);
+      }
+	}
+};
+
+/**
+ * Passes Email object to create StickyNotes
+ * @param {Object} obj Obj can be ZmMailMsg | ZmContact | ZmConv | ZmAppt
+ */
+StickyNotesZimlet.prototype._createStickyNotes =
+function(obj) {
+	if (obj.type == "CONV") {
+		this._itemId = obj.cid;
+	} else if (obj.type == "MSG" || obj.type == "CONTACT" || obj.type == "APPT") {
+		this._itemId = obj.id;
+	} else {
+		return;
+	}
+	this._showStickyNotes(true, "");
+};
+
+/**
+ * Called by Zimbra when an email is opened
+ * @param ZmMailMsg mail
+ */
+StickyNotesZimlet.prototype.onMsgView =
+function(msg) {
+	if (this.stickyNotesDisplayed) {
+        this._hideStickyNotes();
+    }
+
+	this.srcMsgObj = msg;
+	//if no tags, assume no sticknotes, so dont search DB(performance)
+	if (this.srcMsgObj.tags.length == 0) {
+		return;
+	}
+	if (msg.type == "CONV") {
+		this._itemId = msg.cid;
+	} else if (msg.type == "MSG") {
+		this._itemId = msg.id;
+	}
+	this._handleItemSelect();
+};
+
+StickyNotesZimlet.prototype._onContactOrApptView =
+function(controller) {
+   try {
+	var selectedItms = controller.getCurrentView().getSelection();
+   } catch (err) {
+   var selectedItms = controller.getCurrentView().getListView().getSelection();
+   }
+   
+	if (selectedItms.length > 0) {
+		this.srcMsgObj = selectedItms[0];
+		this._itemId = this.srcMsgObj.id;
+	}
+	this._handleItemSelect();
+};
+
+/**
+ * Checks if the item(this._itemId) has stickyNotes, if so, displays that
+ * @param ZmMailMsg mail
+ */
+StickyNotesZimlet.prototype._handleItemSelect =
+function() {
+	this._getStickyNotesMetaData(this._itemId, new AjxCallback(this, this._showStickyNotes, false));
+};
+
+/**
+ * Displays error message.
+ *
+ * @param {string} expnMsg Exception message string
+ */
+StickyNotesZimlet.prototype._showErrorMessage =
+function(expnMsg) {
+	var msg = "";
+	if (expnMsg instanceof AjxException) {
+		msg = expnMsg.msg;
+	} else {
+		msg = expnMsg;
+	}
+	var dlg = appCtxt.getMsgDialog();
+	dlg.reset();
+	dlg.setMessage(msg, DwtMessageDialog.WARNING_STYLE);
+	dlg.popup();
+};
+
+/**
+ * Migrates old data from LDAP(ZCS5.0 - 6.0.6 & Zimlet v1.3) to DB(ZCS 6.0.7 & Zimlet V1.5)
+ */
+StickyNotesZimlet.prototype._migrateOldData =
+function() {
+	var stickyNotes_data = this.getUserProperty("stickyNotes_data");
+	if(stickyNotes_data == "") {
+		return;
+	}
+	var tmpArry = stickyNotes_data.split(":=:");
+	this._msgIdAndDataArry = [];
+	for (var i = 0; i < tmpArry.length; i++) {
+		if (tmpArry[i] == "") {
+			continue;
+		}
+		var tmp2Arry = tmpArry[i].split(",__data::");
+		var msgId = tmp2Arry[0].replace("__id::", "").replace("MSG", "").replace("CONV", "");
+		var data = tmp2Arry[1];
+		this._saveStickyNotesDataToServer(msgId, data);
+	}
+	this.setUserProperty("stickyNotes_data", "", true);
+};
+
+StickyNotesZimlet.prototype._dragElement =
+function (elmnt) {
+	var pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+	if (document.getElementById(elmnt.id + "header")) {
+	  // if present, the header is where you move the DIV from:
+	  document.getElementById(elmnt.id + "header").onmousedown = dragMouseDown;
+	} else {
+	  // otherwise, move the DIV from anywhere inside the DIV:
+	  elmnt.onmousedown = dragMouseDown;
+	}
+  
+	function dragMouseDown(e) {
+	  e = e || window.event;
+	  e.preventDefault();
+	  // get the mouse cursor position at startup:
+	  pos3 = e.clientX;
+	  pos4 = e.clientY;
+	  document.onmouseup = closeDragElement;
+	  // call a function whenever the cursor moves:
+	  document.onmousemove = elementDrag;
+	}
+  
+	function elementDrag(e) {
+	  e = e || window.event;
+	  e.preventDefault();
+	  // calculate the new cursor position:
+	  pos1 = pos3 - e.clientX;
+	  pos2 = pos4 - e.clientY;
+	  pos3 = e.clientX;
+	  pos4 = e.clientY;
+	  // set the element's new position:
+	  elmnt.style.top = (elmnt.offsetTop - pos2) + "px";
+	  elmnt.style.left = (elmnt.offsetLeft - pos1) + "px";
+	}
+  
+	function closeDragElement() {
+	  // stop moving when mouse button is released:
+	  document.onmouseup = null;
+	  document.onmousemove = null;
+	}
+  }
